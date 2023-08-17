@@ -1,0 +1,26 @@
+version: '3'
+
+networks:
+  web:
+    external: true
+    name: ${COMPOSE_NETWORK}
+
+services:
+  node:
+    env_file:
+      - .env
+    image: $IMAGEID:$VERSION
+    container_name: $COMPOSE_PROJECT_NAME
+    restart: always
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    stdin_open: true
+    tty: true
+    hostname: myproxy
+    networks:
+      - web
+    ports:
+      - ${PORT}:${PORT}
+    volumes:
+      - ./:/app

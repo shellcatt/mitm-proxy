@@ -1,0 +1,17 @@
+{
+  "name": "edited-proxy",
+  "version": "0.5.0",
+  "description": "Edited NodeJS Homework",
+  "main": "src/server.js",
+  "scripts": {
+    "test": "curl -x https://$HOST:$PORT -H \"Host: $TARGET_HOST\" $TARGET_HOST",
+    "cluster": "node src/server-cluster.js",
+    "threads": "node src/server-threads.js"
+  },
+  "author": "Krasimir Gruychev",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2"
+  }
+}
