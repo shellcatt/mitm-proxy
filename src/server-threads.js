@@ -1,122 +1,135 @@
 const express = require('express');
 const https = require('https');
 const fs = require('fs');
-const net = require('net');
-const cluster = require('cluster');
+const { Worker, isMainThread, parentPort } = require('worker_threads');
 const os = require('os');
+const net = require('net');
+
 const dotenv = require('dotenv');
 dotenv.config();
 
-const PORT = process.env.PORT || 8443;
-const MAX_QUEUE_SIZE = process.env.MAX_QUEUE_SIZE || 100;
-const MAX_REDIRECTS = process.env.MAX_REDIRECTS || 5;
+const PORT = parseInt(process.env.PORT) || 8443;
+const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE, 10) || 100;
+const MAX_REDIRECTS = parseInt(process.env.MAX_REDIRECTS, 10) || 5;
 
+let queue = [];
 let stats = [];
 
-let isShuttingDown = false;
-
-if (cluster.isMaster) {
-  console.log(`Master ${process.pid} is running`);
-
-  // Fork workers
-  for (let i = 0; i < os.availableParallelism; i++) {
-    cluster.fork();
-  }
-
-  // Respawn crashed workers
-  cluster.on('exit', (worker, code, signal) => {
-    if (!isShuttingDown) {
-        console.log(`Worker ${worker.process.pid} died, forking a new worker`);
-        cluster.fork();  // replace the dead worker
-    } else {
-        console.log(`Worker ${worker.process.pid} shutting down`);
-    }
-  });
-
-  // Handle SIGINT to gracefully shut down all workers
-  process.on('SIGINT', () => {
-    console.log('Master process is shutting down, killing all workers...');
-
-    isShuttingDown = true;
-    for (const id in cluster.workers) {
-      cluster.workers[id].process.kill('SIGTERM');
-    }
-
-    setTimeout(() => {
-      process.exit(0);
-    }, 1000).unref(); 
-  });
-
-  // Collect stats
-  cluster.on('message', (worker, message) => {
-    if (message.statsUpdate) {
-      stats.push(message.statsUpdate);
-      console.log(stats.length, stats)
-    }
-  });
-} else {
+if (isMainThread) {
   const app = express();
-  const serverOptions = {
+
+  const workerPool = Array.from({ length: os.availableParallelism }, () => new Worker(__filename));
+
+  app.all('*', (req, res) => {
+    console.log('...')
+    const startProcessing = Date.now();
+
+    if (queue.length >= MAX_QUEUE_SIZE) {
+      res.status(503).send('Service Unavailable');
+      return;
+    }
+
+    const requestData = {
+      method: req.method,
+      headers: req.headers,
+      url: req.originalUrl
+    };
+
+    const worker = workerPool.shift();
+
+    if (worker) {
+      worker.on('message', (response) => {
+        res.set(response.headers);
+        if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
+          res.redirect(response.statusCode, response.headers.location);
+        } else {
+          res.status(response.statusCode).send(response.data);
+        }
+        
+        const currentStat = {
+            requestSize: JSON.stringify(requestData).length,
+            responseSize: response.data ? response.data.length : 0,
+            processingTime: Date.now() - startProcessing
+        };
+        stats.push(currentStat);
+        console.log(stats.length, currentStat);
+
+        workerPool.push(worker);
+      });
+
+      worker.postMessage(requestData);
+    } else {
+      queue.push(requestData);
+    }
+  });
+
+  https.createServer({
     key: fs.readFileSync('/etc/ssl/private/ssl-cert-snakeoil.key'),
     cert: fs.readFileSync('/etc/ssl/certs/ssl-cert-snakeoil.pem')
+  }, app).listen(PORT, () => {
+    console.log(`Proxy server listening on port ${PORT}`);
+  })
+  
+  processNextRequest();
+
+} else {
+  const agent = new https.Agent({ 
+    keepAlive: true, 
+    // maxSockets: 10 
+  });
+
+  const processRequest = (requestData, redirectCount = 0) => {
+    return new Promise((resolve, reject) => {
+      const requestOptions = {
+        method: requestData.method,
+        headers: requestData.headers,
+        hostname: requestData.headers['host'],
+        path: requestData.url,
+        agent
+      };
+
+      const proxyReq = https.request(requestOptions, (proxyRes) => {
+        let data = [];
+        proxyRes.on('data', chunk => data.push(chunk));
+        proxyRes.on('end', () => {
+          if (proxyRes.statusCode >= 300 && proxyRes.statusCode < 400 && proxyRes.headers.location && redirectCount < MAX_REDIRECTS) {
+            requestData.url = proxyRes.headers.location;
+            resolve(processRequest(requestData, redirectCount + 1));
+          } else {
+            resolve({
+              statusCode: proxyRes.statusCode,
+              headers: proxyRes.headers,
+              data: Buffer.concat(data).toString(),
+              redirectCount
+            });
+          }
+        });
+      });
+
+      proxyReq.on('error', reject);
+      proxyReq.end();
+    });
   };
 
-  // Used for dry run tests
-  app.use((req, res, next) => {
-    if (req.method !== 'CONNECT') {
-      return res.status(405).end('Method Not Allowed');
+  parentPort.on('message', (requestData) => {
+    processRequest(requestData)
+      .then(response => parentPort.postMessage(response))
+      .catch(error => parentPort.postMessage({ error: error.message }));
+  });
+}
+
+function processNextRequest() {
+  if (queue.length > 0) {
+    const requestData = queue.shift();
+    const worker = workerPool.shift();
+    if (worker) {
+      worker.on('message', (response) => {
+        workerPool.push(worker);
+      });
+      worker.postMessage(requestData);
     } else {
-      next();
+      queue.unshift(requestData);
     }
-  });
-
-  const server = https.createServer(serverOptions, app);
-  server.listen(PORT, () => {
-    console.log(`Worker ${process.pid} started and listening on port ${PORT}`);
-  });
-
-
-  server.on('connect', (req, clientSocket, head) => {
-    console.log(`CONNECT request intercepted by ${process.pid}!`);
-
-    const startProcessing = Date.now();
-    const [hostname, port] = req.url.split(':');
-    const currentStat = {
-        _pid: process.pid,
-        url: req.url,
-        requestSize: 0,
-        responseSize: 0,
-        processingTime: 0
-    };
-
-    const serverSocket = net.connect(port || 443, hostname, () => {
-        clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-        serverSocket.write(head);
-        serverSocket.pipe(clientSocket);
-        clientSocket.pipe(serverSocket);
-    });
-
-    serverSocket.on('data', (chunk) => {
-        currentStat.responseSize += chunk.length;
-    });
-    
-    clientSocket.on('data', (chunk) => {
-        currentStat.requestSize += chunk.length;
-    });
-
-    let statsFinalized = false;
-    const finalizeStats = () => {
-        if (!statsFinalized) { // Prevent from calling twice
-            currentStat.processingTime = Date.now() - startProcessing;
-            // stats.push(currentStat);
-            // console.log(stats.length, currentStat);
-            process.send({ statsUpdate: currentStat });
-            statsFinalized = true;
-        }
-    };
-
-    // When the connection ends or is closed, finalize and log the stats.
-    clientSocket.on('close', finalizeStats);
-    serverSocket.on('close', finalizeStats);
-  });
+  }
+  setTimeout(processNextRequest, 0);
 }
